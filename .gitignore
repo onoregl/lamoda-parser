@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.env
+.env.*
+*.log
+images/
+images_lamoda_nova/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
