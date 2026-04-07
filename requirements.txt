@@ -1,6 +1,2 @@
 requests>=2.32.0
-Pillow>=10.0.0
-transformers>=4.57.0
-torch>=2.1.0
 boto3>=1.34.0
-
