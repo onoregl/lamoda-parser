@@ -5,6 +5,7 @@
 
 Threading: параллельная обработка + немедленная запись в JSONL-файл.
 Resume: при повторном запуске пропускает уже обработанные товары.
+S3 checkpoint: периодически синхронизирует результаты в S3 (для resume при рестарте пода).
 """
 
 import json
@@ -17,6 +18,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional, Set
 from pathlib import Path
+from urllib.parse import urlparse
 
 import boto3
 from botocore.exceptions import ClientError
@@ -224,6 +226,48 @@ class NovaImageDescriber:
             return None
 
 
+def s3_parse(s3_uri: str):
+    """Разбирает s3://bucket/key в (bucket, key)."""
+    parsed = urlparse(s3_uri)
+    return parsed.netloc, parsed.path.lstrip("/")
+
+
+def s3_download(s3_uri: str, local_path: Path, region: str = "us-east-1") -> bool:
+    """Скачивает файл из S3, возвращает True если скачан."""
+    try:
+        bucket, key = s3_parse(s3_uri)
+        s3 = boto3.client("s3", region_name=region)
+        s3.download_file(bucket, key, str(local_path))
+        print(f"[S3] Скачан checkpoint: {s3_uri} → {local_path}")
+        return True
+    except Exception as e:
+        print(f"[S3] Checkpoint не найден или ошибка: {e}")
+        return False
+
+
+def s3_upload(local_path: Path, s3_uri: str, region: str = "us-east-1") -> bool:
+    """Загружает файл в S3."""
+    try:
+        bucket, key = s3_parse(s3_uri)
+        s3 = boto3.client("s3", region_name=region)
+        s3.upload_file(str(local_path), bucket, key)
+        print(f"[S3] Checkpoint сохранён: {local_path} → {s3_uri}")
+        return True
+    except Exception as e:
+        print(f"[S3] Ошибка загрузки в S3: {e}")
+        return False
+
+
+def s3_sync_loop(local_path: Path, s3_uri: str, region: str, interval_sec: int, stop_event: threading.Event):
+    """Фоновый поток: синхронизирует файл в S3 каждые interval_sec секунд."""
+    while not stop_event.wait(interval_sec):
+        if local_path.exists():
+            s3_upload(local_path, s3_uri, region)
+    # Финальная синхронизация при завершении
+    if local_path.exists():
+        s3_upload(local_path, s3_uri, region)
+
+
 def load_processed_ids(output_file: Path) -> Set[str]:
     """Загружает уже обработанные ID из JSONL-файла (для resume при перезапуске)."""
     processed = set()
@@ -252,14 +296,21 @@ def process_products(
     aws_profile: Optional[str] = None,
     region: str = "us-east-1",
     workers: int = 5,
+    s3_checkpoint: Optional[str] = None,
+    s3_sync_interval: int = 120,
 ):
     """
     Обрабатывает товары параллельно (ThreadPoolExecutor).
     Каждый результат сразу пишется в JSONL-файл (одна строка = один товар).
     При повторном запуске пропускает уже обработанные товары (resume).
+    s3_checkpoint: если указан (s3://bucket/key), скачивает при старте и синхронизирует каждые s3_sync_interval сек.
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
+
+    # S3 checkpoint: скачать предыдущий прогресс
+    if s3_checkpoint and not output_path.exists():
+        s3_download(s3_checkpoint, output_path, region)
 
     print(f"[INFO] Загрузка товаров из {input_path}...")
     with open(input_path, "r", encoding="utf-8") as f:
@@ -329,6 +380,17 @@ def process_products(
     print(f"[INFO] Запуск {workers} потоков...")
     start_time = time.time()
 
+    # Фоновая синхронизация в S3
+    stop_sync = threading.Event()
+    if s3_checkpoint:
+        sync_thread = threading.Thread(
+            target=s3_sync_loop,
+            args=(output_path, s3_checkpoint, region, s3_sync_interval, stop_sync),
+            daemon=True,
+        )
+        sync_thread.start()
+        print(f"[S3] Авто-синхронизация каждые {s3_sync_interval}с → {s3_checkpoint}")
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [executor.submit(process_one, p) for p in products]
         for future in as_completed(futures):
@@ -336,6 +398,10 @@ def process_products(
                 future.result()
             except Exception as e:
                 print(f"[ERROR] Необработанное исключение в потоке: {e}")
+
+    stop_sync.set()
+    if s3_checkpoint:
+        sync_thread.join(timeout=30)
 
     elapsed = time.time() - start_time
     print(f"\n[SUCCESS] Готово за {elapsed/3600:.1f} ч ({elapsed:.0f} сек)")
@@ -359,6 +425,8 @@ if __name__ == "__main__":
     parser.add_argument("--images-dir", type=str, default=None, help="Директория для кэша изображений")
     parser.add_argument("--profile", type=str, default=None, help="AWS профиль (по умолчанию: env vars / IAM Role)")
     parser.add_argument("--region", type=str, default="us-east-1", help="AWS регион")
+    parser.add_argument("--s3-checkpoint", type=str, default=None, help="S3 URI для checkpoint (s3://bucket/key.jsonl)")
+    parser.add_argument("--s3-sync-interval", type=int, default=120, help="Интервал синхронизации в S3 (сек, default: 120)")
 
     args = parser.parse_args()
 
@@ -374,4 +442,6 @@ if __name__ == "__main__":
         aws_profile=args.profile,
         region=args.region,
         workers=args.workers,
+        s3_checkpoint=args.s3_checkpoint,
+        s3_sync_interval=args.s3_sync_interval,
     )

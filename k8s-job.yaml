@@ -1,0 +1,62 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lamoda-descriptions
+  namespace: modera
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: lamoda-descriptions
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: processor
+          image: python:3.11-slim
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+              echo "[INIT] Установка зависимостей..."
+              apt-get update -qq && apt-get install -y git curl -qq
+              git clone https://github.com/onoregl/lamoda-parser.git /app
+              cd /app
+              pip install -r requirements.txt -q
+              echo "[INIT] Запуск обработки..."
+              python add_descriptions_nova.py \
+                --input lamoda_women.cleaned.json \
+                --output /data/results.jsonl \
+                --workers 5 \
+                --region us-east-1 \
+                --s3-checkpoint s3://modera-us/tmp/lamoda-descriptions/results.jsonl \
+                --s3-sync-interval 120
+              echo "[DONE] Финальная загрузка в S3..."
+              aws s3 cp /data/results.jsonl s3://modera-us/tmp/lamoda-descriptions/results.jsonl
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: lamoda-aws-secret
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: lamoda-aws-secret
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
