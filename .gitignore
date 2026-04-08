@@ -8,6 +8,10 @@ venv/
 *.log
 images/
 images_lamoda_nova/
+
+# Результаты обработки (большие файлы, хранятся в S3)
+*.jsonl
+lamoda_women_with_descriptions_nova.json
 .DS_Store
 Thumbs.db
 .idea/
